@@ -456,8 +456,37 @@ export async function POST(req: NextRequest) {
             }
 
             const chat = model.startChat({ history: sanitizedHistory });
-            const result = await chat.sendMessage(userMessage);
-            const geminiText = result.response.text();
+
+            // If we already have search results, inject them with the message
+            let fallbackMessage = userMessage;
+            if (searchResults.length > 0) {
+              fallbackMessage = `Here are product listings for your search: ${JSON.stringify(searchResults)}. Please output the explore_carousel JSON now with the best options. Make sure to provide a valid headline, products array, and deep_dive markdown string.`;
+            }
+
+            const result = await chat.sendMessage(fallbackMessage);
+            let geminiText = result.response.text();
+
+            // Handle 2-turn search flow: if Gemini returns search_intent, do the search and ask again
+            try {
+              const parsed = JSON.parse(geminiText.replace(/```json|```/g, "").trim());
+              if (parsed?.ui_type === "search_intent" && mode !== "deep_research") {
+                console.log("[route] Gemini fallback returned search_intent, running inline search...");
+                const { searchForProducts } = await import("@/lib/agents/search");
+                const query = typeof parsed.query === "string" ? parsed.query : userMessage;
+                const inlineProducts = await searchForProducts(query, 10);
+
+                if (inlineProducts.length > 0) {
+                  const carouselPrompt = `Here are product listings for your search: ${JSON.stringify(inlineProducts)}. Please output the explore_carousel JSON now with the best options. Make sure to provide a valid headline, products array, and deep_dive markdown string.`;
+                  const secondResult = await chat.sendMessage(carouselPrompt);
+                  geminiText = secondResult.response.text();
+
+                  // Also emit product metadata for the frontend
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'metadata', products: inlineProducts })}\n\n`));
+                }
+              }
+            } catch (parseErr) {
+              // Not valid JSON or not search_intent, just use as-is
+            }
 
             fullResponse = geminiText;
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'chunk', text: geminiText })}\n\n`));
