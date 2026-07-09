@@ -227,25 +227,8 @@ export async function POST(req: NextRequest) {
 
     // ── Step 1: Router determines mode ──────────────────
     const originalMode = mode;
-    if (mode === "explore") {
-      try {
-        const determinedMode = await determineIntent(userMessage, userHistory);
-        if (determinedMode === "deep_research") {
-          mode = "deep_research";
-          // Update the session mode in Supabase so future messages stay in deep_research
-          const supabase = await createClient();
-          const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(chatId);
-          if (isUUID) {
-            await supabase
-              .from("chat_sessions")
-              .update({ mode: "deep_research" })
-              .eq("id", chatId);
-          }
-        }
-      } catch (routerErr) {
-        console.warn("Failed to determine intent dynamically:", routerErr);
-      }
-    }
+    // Removed automatic routing to 'deep_research'.
+    // The user explicitly selects the mode, and if not selected, it defaults to 'explore'.
 
     // ── Step 2: Cache check ───────────────────────────────────────────────────
     // Skip cache for regenerate requests and buy_explanation (handled above).
