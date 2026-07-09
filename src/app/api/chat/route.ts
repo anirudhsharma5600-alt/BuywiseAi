@@ -44,7 +44,7 @@ import { executeRerankedSearch } from "@/lib/providers/test-serper";
 import type { RerankedContext } from "@/lib/retrieval/index";
 import { executeGenerativeOrchestration } from "@/lib/guardrails/apiOrchestrator";
 import { checkSemanticCache, storeInSemanticCache } from "@/lib/caching/semanticCache";
-import { getNextGroqKey } from "@/lib/agents/keyManager";
+import { getNextGroqKey, getNextGeminiClient } from "@/lib/agents/keyManager";
 
 const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEYS[0]);
 
@@ -429,66 +429,45 @@ export async function POST(req: NextRequest) {
           }, chatId);
 
         } catch (streamErr: any) {
-          console.warn("Switching to Groq streaming fallback orchestration channel...", streamErr.message || streamErr);
+          console.warn("[route] Primary stream failed, switching to Gemini non-streaming fallback...", streamErr.message || streamErr);
           try {
-            const activeGroqKey = getNextGroqKey();
-            if (!activeGroqKey) throw new Error("Groq credentials pool unavailable.");
-
             const { EXPLORE_SYSTEM_PROMPT, DEEP_RESEARCH_SYSTEM_PROMPT } = await import('@/lib/agents/writer');
             const systemInstruction = mode === "deep_research" ? DEEP_RESEARCH_SYSTEM_PROMPT : EXPLORE_SYSTEM_PROMPT;
 
-            const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-              method: "POST",
-              headers: { "Authorization": `Bearer ${activeGroqKey}`, "Content-Type": "application/json" },
-              body: JSON.stringify({
-                model: "llama-3.3-70b-versatile",
-                stream: true,
-                messages: [
-                  { role: "system", content: systemInstruction },
-                  ...userHistory.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content || "" })),
-                  { role: "user", content: userMessage }
-                ]
-              })
+            // Use Gemini non-streaming as last resort (NOT Groq again — it's what failed)
+            const geminiClient = getNextGeminiClient();
+            const model = geminiClient.getGenerativeModel({
+              model: "gemini-2.5-flash",
+              systemInstruction,
+              generationConfig: { responseMimeType: "application/json" }
             });
 
-            if (!groqResponse.ok) throw new Error(`Groq stream connection error: ${groqResponse.status}`);
+            const geminiHistory = userHistory.slice(0, -1).map((m) => ({
+              role: m.role === "assistant" ? "model" : "user",
+              parts: [{ text: m.content || "" }]
+            })).filter(m => m.parts[0].text.trim() !== "");
 
-            const reader = groqResponse.body?.getReader();
-            const decoder = new TextDecoder();
-            if (!reader) throw new Error("Failed to extract active reader stream descriptor.");
-
-            let fallbackDataTagFound = false;
-            let fallbackJsonBuffer = "";
-
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-
-              const chunkStr = decoder.decode(value, { stream: true });
-              const lines = chunkStr.split("\n").filter(line => line.trim() !== "");
-
-              for (const line of lines) {
-                if (line.includes("data: [DONE]")) break;
-                if (line.startsWith("data: ")) {
-                  try {
-                    const parsed = JSON.parse(line.slice(6));
-                    const textDelta = parsed.choices[0]?.delta?.content || "";
-                    fullResponse += textDelta;
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'chunk', text: textDelta })}\n\n`));
-                  } catch (e) { }
-                }
+            // Ensure alternating roles
+            const sanitizedHistory: typeof geminiHistory = [];
+            for (const msg of geminiHistory) {
+              if (sanitizedHistory.length === 0 || sanitizedHistory[sanitizedHistory.length - 1].role !== msg.role) {
+                sanitizedHistory.push(msg);
               }
             }
 
-            if (fallbackJsonBuffer.trim()) {
-              try {
-                const parsedProducts = JSON.parse(fallbackJsonBuffer.replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim());
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'metadata', products: parsedProducts })}\n\n`));
-              } catch (err) { }
-            }
+            const chat = model.startChat({ history: sanitizedHistory });
+            const result = await chat.sendMessage(userMessage);
+            const geminiText = result.response.text();
+
+            fullResponse = geminiText;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'chunk', text: geminiText })}\n\n`));
           } catch (fallbackError: any) {
-            console.error("Critical Execution Fault across both pipelines:", fallbackError);
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'chunk', text: `\\n[Stream Interrupted: ${fallbackError.message}]` })}\n\n`));
+            console.error("[route] Critical: Both streaming and Gemini fallback failed:", fallbackError);
+            const safeMsg = JSON.stringify({
+              ui_type: "text_response",
+              text: "I'm experiencing high traffic right now. Please try again in a few seconds — your query is saved!"
+            });
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'chunk', text: safeMsg })}\n\n`));
           }
         } finally {
           controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
